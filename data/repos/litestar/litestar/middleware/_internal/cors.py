@@ -1,0 +1,197 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from litestar.config.cors import _build_allowed_origins_regex, _build_preflight_headers, _build_simple_headers
+from litestar.constants import DEFAULT_ALLOWED_CORS_HEADERS
+from litestar.datastructures import Headers, MutableScopeHeaders
+from litestar.enums import HttpMethod, MediaType, ScopeType
+from litestar.middleware.base import ASGIMiddleware
+from litestar.response import Response
+from litestar.status_codes import HTTP_204_NO_CONTENT, HTTP_400_BAD_REQUEST
+
+if TYPE_CHECKING:
+    from typing import Literal
+
+    from litestar.types import ASGIApp, Message, Method, Receive, Scope, Send
+
+__all__ = ("CORSMiddleware",)
+
+
+class CORSMiddleware(ASGIMiddleware):
+    """CORS Middleware."""
+
+    scopes = (ScopeType.HTTP,)
+
+    def __init__(
+        self,
+        *,
+        allow_origins: list[str] | None = None,
+        allow_methods: list[Literal["*"] | Method] | None = None,
+        allow_headers: list[str] | None = None,
+        allow_credentials: bool = False,
+        allow_origin_regex: str | None = None,
+        expose_headers: list[str] | None = None,
+        max_age: int = 600,
+    ) -> None:
+        """Middleware that adds CORS validation to the application.
+
+        Args:
+            allow_origins: List of origins that are allowed. Can use ``*`` in any component of the
+                path, e.g. ``domain.*``.
+            allow_methods: List of allowed HTTP methods.
+            allow_headers: List of allowed headers.
+            allow_credentials: Boolean dictating whether to set the
+                ``Access-Control-Allow-Credentials`` header.
+            allow_origin_regex: Regex to match origins against.
+            expose_headers: List of headers that are exposed via the
+                ``Access-Control-Expose-Headers`` header.
+            max_age: Response caching TTL in seconds, sets the ``Access-Control-Max-Age`` header.
+        """
+        self.allow_origins = ["*"] if allow_origins is None else list(allow_origins)
+        self.allow_methods: list[Literal["*"] | Method] = ["*"] if allow_methods is None else list(allow_methods)
+        self.allow_headers = [v.lower() for v in (["*"] if allow_headers is None else allow_headers)]
+        self.allow_credentials = allow_credentials
+        self.allow_origin_regex = allow_origin_regex
+        self.expose_headers = [] if expose_headers is None else list(expose_headers)
+        self.max_age = max_age
+
+        self.is_allow_all_origins = "*" in self.allow_origins
+        self.is_allow_all_methods = "*" in self.allow_methods
+        self.is_allow_all_headers = "*" in self.allow_headers
+        self.allowed_origins_regex = _build_allowed_origins_regex(
+            allow_origins=self.allow_origins,
+            allow_origin_regex=self.allow_origin_regex,
+        )
+        self.preflight_headers = _build_preflight_headers(
+            allow_origins=self.allow_origins,
+            allow_methods=self.allow_methods,
+            allow_headers=self.allow_headers,
+            allow_credentials=self.allow_credentials,
+            max_age=self.max_age,
+        )
+        self.simple_headers = _build_simple_headers(
+            allow_origins=self.allow_origins,
+            allow_credentials=self.allow_credentials,
+            expose_headers=self.expose_headers,
+        )
+
+    def is_origin_allowed(self, origin: str) -> bool:
+        """Check whether a given origin is allowed.
+
+        Args:
+            origin: An origin header value.
+
+        Returns:
+            Boolean determining whether an origin is allowed.
+        """
+        return bool(self.is_allow_all_origins or self.allowed_origins_regex.fullmatch(origin))
+
+    async def handle(self, scope: Scope, receive: Receive, send: Send, next_app: ASGIApp) -> None:
+        """Handle ASGI call.
+
+        Args:
+            scope: The ASGI connection scope.
+            receive: The ASGI receive function.
+            send: The ASGI send function.
+            next_app: The next ASGI application in the middleware stack to call.
+
+        Returns:
+            None
+        """
+        if scope["type"] != ScopeType.HTTP:
+            await next_app(scope, receive, send)
+            return
+
+        headers = Headers.from_scope(scope=scope)
+        origin = headers.get("origin")
+
+        if scope["method"] == HttpMethod.OPTIONS and origin:
+            request = scope["litestar_app"].request_class(scope=scope, receive=receive, send=send)
+            asgi_response = self._create_preflight_response(origin=origin, request_headers=headers).to_asgi_response(
+                request=request
+            )
+            await asgi_response(scope, receive, send)
+        elif origin:
+            await next_app(scope, receive, self.send_wrapper(send=send, origin=origin, has_cookie="cookie" in headers))
+        else:
+            await next_app(scope, receive, send)
+
+    def send_wrapper(self, send: Send, origin: str, has_cookie: bool) -> Send:
+        """Wrap ``send`` to ensure that state is not disconnected.
+
+        Args:
+            has_cookie: Boolean flag dictating if the connection has a cookie set.
+            origin: The value of the ``Origin`` header.
+            send: The ASGI send function.
+
+        Returns:
+            An ASGI send function.
+        """
+
+        async def wrapped_send(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                message.setdefault("headers", [])
+                headers = MutableScopeHeaders.from_message(message=message)
+                headers.update(self.simple_headers)
+
+                if (self.is_allow_all_origins and has_cookie) or (
+                    not self.is_allow_all_origins and self.is_origin_allowed(origin=origin)
+                ):
+                    headers["Access-Control-Allow-Origin"] = origin
+                    headers["Vary"] = "Origin"
+
+                headers["Access-Control-Allow-Headers"] = ", ".join(sorted(set(self.allow_headers)))
+
+                headers["Access-Control-Allow-Methods"] = ", ".join(sorted(set(self.allow_methods)))
+
+            await send(message)
+
+        return wrapped_send
+
+    def _create_preflight_response(self, origin: str, request_headers: Headers) -> Response[str | None]:
+        pre_flight_method = request_headers.get("Access-Control-Request-Method")
+        failures = []
+
+        if not self.is_allow_all_methods and (pre_flight_method and pre_flight_method not in self.allow_methods):
+            failures.append("method")
+
+        response_headers = self.preflight_headers.copy()
+
+        if not self.is_origin_allowed(origin):
+            failures.append("Origin")
+        elif response_headers.get("Access-Control-Allow-Origin") != "*":
+            response_headers["Access-Control-Allow-Origin"] = origin
+
+        pre_flight_requested_headers = [
+            header.strip()
+            for header in request_headers.get("Access-Control-Request-Headers", "").split(",")
+            if header.strip()
+        ]
+
+        if pre_flight_requested_headers:
+            if self.is_allow_all_headers:
+                response_headers["Access-Control-Allow-Headers"] = ", ".join(
+                    sorted(set(pre_flight_requested_headers) | DEFAULT_ALLOWED_CORS_HEADERS)
+                )
+            else:
+                all_allowed_headers = set(self.allow_headers).union(
+                    default_header.lower() for default_header in DEFAULT_ALLOWED_CORS_HEADERS
+                )
+                if any(header.lower() not in all_allowed_headers for header in pre_flight_requested_headers):
+                    failures.append("headers")
+
+        return (
+            Response(
+                content=f"Disallowed CORS {', '.join(failures)}",
+                status_code=HTTP_400_BAD_REQUEST,
+                media_type=MediaType.TEXT,
+            )
+            if failures
+            else Response(
+                content=None,
+                status_code=HTTP_204_NO_CONTENT,
+                media_type=MediaType.TEXT,
+                headers=response_headers,
+            )
+        )

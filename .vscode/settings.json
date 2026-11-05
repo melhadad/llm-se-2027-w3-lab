@@ -1,0 +1,25 @@
+{
+  // Use the uv-managed virtualenv in this folder, not the system Python.
+  // `uv run` creates it; if it is missing, run `uv sync` and reload the window.
+  //
+  // On Windows the interpreter lives at .venv\Scripts\python.exe instead, so
+  // this path does not resolve there -- the Python extension then falls back to
+  // auto-discovering the workspace .venv, which finds the right one. If it does
+  // not, run "Python: Select Interpreter" and pick the ./.venv entry.
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.terminal.activateEnvironment": true,
+
+  // src layout: `triage_lab` is imported from src/. Point the language server
+  // at it, so `from triage_lab... import` is not shown as unresolved.
+  "python.analysis.extraPaths": ["src"],
+
+  // The notebook runs from the repo root, so paths like data/ work the same
+  // in the notebook and in the terminal.
+  "jupyter.notebookFileRoot": "${workspaceFolder}",
+
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "**/.dspy_cache": true
+  }
+}

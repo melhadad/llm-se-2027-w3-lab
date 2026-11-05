@@ -1,0 +1,64 @@
+[project]
+name = "llm-se-2027-w3-lab"
+version = "0.1.0"
+description = "W3 lab: issue triage with DSPy (signatures, structured output, tools, ReAct, optimization)"
+requires-python = ">=3.13"
+dependencies = [
+    # Pinned to the same version as W1. The notebook's API calls are written
+    # against 3.3.1; a newer DSPy may rename things mid-lab.
+    "dspy==3.3.1",
+    "pydantic>=2.9",
+    "python-dotenv>=1.0",
+    # The notebook kernel. VSCode's Jupyter extension runs the notebook with
+    # the .venv interpreter, and that interpreter needs ipykernel installed.
+    "ipykernel>=6.29",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "nbformat>=5.10",
+    "nbclient>=0.10",
+]
+
+# Same reason as W1: `uv sync` installs src/ in editable mode, so
+# `import triage_lab` works from the notebook and from tools/ on every OS
+# without setting PYTHONPATH.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+sources = ["src"]
+only-include = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]
+
+[tool.pyright]
+include = ["src", "tests"]
+ignore = ["tools", "data"]
+pythonVersion = "3.13"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+
+# As in W1, the DSPy boundary is named file by file, never as a directory.
+[[tool.pyright.executionEnvironments]]
+root = "src/triage_lab/evaluate.py"
+reportUnknownMemberType = "warning"
+reportUnknownVariableType = "warning"
+reportUnknownArgumentType = "warning"
+
+[[tool.pyright.executionEnvironments]]
+root = "src/triage_lab/lm.py"
+reportUnknownMemberType = "warning"
+reportUnknownVariableType = "warning"
+reportUnknownArgumentType = "warning"
+
+[[tool.pyright.executionEnvironments]]
+root = "src/triage_lab/lm_offline.py"
+reportUnknownMemberType = "warning"
+reportUnknownVariableType = "warning"
+reportUnknownArgumentType = "warning"
