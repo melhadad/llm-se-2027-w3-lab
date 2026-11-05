@@ -1,0 +1,224 @@
+from __future__ import annotations
+
+from inspect import getmro
+from typing import TYPE_CHECKING, Any, cast
+
+from litestar.enums import ScopeType
+from litestar.exceptions import HTTPException, LitestarException, WebSocketException
+from litestar.exceptions.responses import create_exception_response
+from litestar.exceptions.responses._debug_response import (
+    create_debug_response,
+)
+from litestar.status_codes import HTTP_500_INTERNAL_SERVER_ERROR
+from litestar.utils._exceptions import _collapse_exception_groups
+from litestar.utils.empty import value_or_raise
+from litestar.utils.scope.state import ScopeState
+
+if TYPE_CHECKING:
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+
+    from litestar import Response
+    from litestar.app import Litestar
+    from litestar.connection import Request
+    from litestar.handlers import BaseRouteHandler
+    from litestar.types import (
+        ASGIApp,
+        ExceptionHandler,
+        ExceptionHandlersMap,
+        Message,
+        Receive,
+        Scope,
+        Send,
+    )
+    from litestar.types.asgi_types import WebSocketCloseEvent
+
+__all__ = ("ExceptionHandlerMiddleware",)
+
+
+def get_exception_handler(
+    exception_handlers: ExceptionHandlersMap,
+    exc: Exception,
+) -> ExceptionHandler | None:
+    """Given a dictionary that maps exceptions and status codes to handler functions, and an exception, returns the
+    appropriate handler if existing.
+
+    Status codes are given preference over exception type.
+
+    If no status code match exists, each class in the MRO of the exception type is checked and
+    the first matching handler is returned.
+
+    Finally, if a ``500`` handler is registered, it will be returned for any exception that isn't a
+    subclass of :class:`HTTPException <litestar.exceptions.HTTPException>`.
+
+    Args:
+        exception_handlers: Mapping of status codes and exception types to handlers.
+        exc: Exception Instance to be resolved to a handler.
+
+    Returns:
+        Optional exception handler callable.
+    """
+    if not exception_handlers:
+        return None
+
+    default_handler: ExceptionHandler | None = None
+    if isinstance(exc, HTTPException):
+        if exception_handler := exception_handlers.get(exc.status_code):
+            return exception_handler
+    else:
+        default_handler = exception_handlers.get(HTTP_500_INTERNAL_SERVER_ERROR)
+
+    return next(
+        (exception_handlers[cast("type[Exception]", cls)] for cls in getmro(type(exc)) if cls in exception_handlers),
+        default_handler,
+    )
+
+
+def _starlette_exception_handler(request: Request[Any, Any, Any], exc: StarletteHTTPException) -> Response:
+    return create_exception_response(
+        request=request,
+        exc=HTTPException(
+            detail=exc.detail,
+            status_code=exc.status_code,
+            headers=exc.headers,  # type: ignore[arg-type]
+        ),
+    )
+
+
+class ExceptionHandlerMiddleware:
+    """Middleware used to wrap an ASGIApp inside a try catch block and handle any exceptions raised.
+
+    This used in multiple layers of Litestar.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        """Initialize ``ExceptionHandlerMiddleware``.
+
+        Args:
+            app: The ``next`` ASGI app to call.
+
+        """
+        self.app = app
+
+    @staticmethod
+    def _get_debug_scope(scope: Scope) -> bool:
+        return scope["litestar_app"].debug
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """ASGI-callable.
+
+        Args:
+            scope: The ASGI connection scope.
+            receive: The ASGI receive function.
+            send: The ASGI send function.
+
+        Returns:
+            None
+        """
+        scope_state = ScopeState.from_scope(scope)
+
+        if scope["type"] == ScopeType.HTTP:
+
+            async def wrapped_send(event: Message) -> None:
+                if event["type"] == "http.response.start":
+                    scope_state.response_started = True
+                await send(event)
+
+        else:
+            wrapped_send = send  # type: ignore[assignment]
+
+        try:
+            await self.app(scope, receive, wrapped_send)
+        except Exception as exc:
+            if scope_state.response_started:
+                raise LitestarException("Exception caught after response started") from exc
+
+            litestar_app = scope["litestar_app"]
+
+            for hook in litestar_app.after_exception:
+                await hook(exc, scope)
+
+            if litestar_app.pdb_on_exception:
+                litestar_app.debugger_module.post_mortem()
+
+            # collapse ExceptionGroups with one exception, so we can properly handle
+            # them for dispatching
+            exc = _collapse_exception_groups(exc)
+
+            if scope["type"] == ScopeType.HTTP:
+                await self.handle_request_exception(
+                    litestar_app=litestar_app, scope=scope, receive=receive, send=send, exc=exc
+                )
+            else:
+                await self.handle_websocket_exception(send=send, exc=exc)
+
+    async def handle_request_exception(
+        self, litestar_app: Litestar, scope: Scope, receive: Receive, send: Send, exc: Exception
+    ) -> None:
+        """Handle exception raised inside 'http' scope routes.
+
+        Args:
+            litestar_app: The litestar app instance.
+            scope: The ASGI connection scope.
+            receive: The ASGI receive function.
+            send: The ASGI send function.
+            exc: The caught exception.
+
+        Returns:
+            None.
+        """
+
+        exception_handlers = value_or_raise(ScopeState.from_scope(scope).exception_handlers)
+        request: Request[Any, Any, Any] = litestar_app.request_class(scope=scope, receive=receive, send=send)
+        exception_handler = get_exception_handler(exception_handlers, exc) or self.get_default_http_exception_handler(
+            request, exc
+        )
+
+        if exception_handler is None:
+            raise exc
+
+        response = exception_handler(request, exc)
+        route_handler: BaseRouteHandler | None = scope.get("route_handler")
+        type_encoders = route_handler.type_encoders if route_handler else litestar_app.type_encoders
+        await response.to_asgi_response(request=request, type_encoders=type_encoders)(
+            scope=scope, receive=receive, send=send
+        )
+
+    @staticmethod
+    async def handle_websocket_exception(send: Send, exc: Exception) -> None:
+        """Handle exception raised inside 'websocket' scope routes.
+
+        Args:
+            send: The ASGI send function.
+            exc: The caught exception.
+
+        Returns:
+            None.
+        """
+        if isinstance(exc, WebSocketException):
+            code = exc.code
+            reason = exc.detail
+        elif isinstance(exc, LitestarException):
+            reason = exc.detail
+            code = 4000 + HTTP_500_INTERNAL_SERVER_ERROR
+        else:
+            raise exc
+
+        event: WebSocketCloseEvent = {"type": "websocket.close", "code": code, "reason": reason}
+        await send(event)
+
+    def get_default_http_exception_handler(self, request: Request, exc: Exception) -> ExceptionHandler | None:
+        """Handle an HTTP exception by returning the appropriate response.
+
+        Args:
+            request: An HTTP Request instance.
+            exc: The caught exception.
+
+        Returns:
+            An HTTP response.
+        """
+        status_code = exc.status_code if isinstance(exc, HTTPException) else HTTP_500_INTERNAL_SERVER_ERROR
+        if status_code == HTTP_500_INTERNAL_SERVER_ERROR and self._get_debug_scope(request.scope):
+            return create_debug_response
+        if isinstance(exc, HTTPException):
+            return create_exception_response
+        return None

@@ -1,0 +1,31 @@
+<!doctype html>
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <style type="text/css">
+      {styles}
+    </style>
+    <title>Litestar exception page</title>
+  </head>
+  <body>
+    <h4>{error}</h4>
+    <h3><span>{error_description}</span></h3>
+    <div class="traceback-controls">
+      <button id="copyBtn" onclick="copyTraceback()">
+        Copy traceback to clipboard
+      </button>
+      <button id="toggleView" onclick="toggleTracebackView()">
+        Plaintext view
+      </button>
+    </div>
+    <div id="browserTraceback">{exception_data}</div>
+    <div id="pastebinTraceback" style="display: none">
+      <textarea id="traceback_area" readonly rows="30">{plain_text_traceback}</textarea>
+    </div>
+    <script type="text/javascript">
+      // prettier-ignore
+      {scripts} // NOSONAR
+    </script>
+  </body>
+</html>
