@@ -13,6 +13,7 @@ from triage_lab.lm_offline import OFFLINE, OfflineLM
 
 def connect() -> dspy.BaseLM:
     """Create the LM named by LLM_MODEL and make it DSPy's default."""
+    load_api_keys()
     model = model_name()
     if not model:
         raise RuntimeError("LLM_MODEL is not set: copy .env.example to .env and fill it in")
@@ -28,14 +29,15 @@ def connect() -> dspy.BaseLM:
     return lm
 
 
-def model_name() -> str:
-    """LLM_MODEL from .env, read fresh each time (edit .env, rerun the cell).
+def load_api_keys() -> None:
+    """Put the provider keys in .env into the environment.
 
-    The provider keys in .env are put into the environment, where LiteLLM
-    finds them. They win over an old key exported in your shell.
     """
-    values = dotenv_values(ROOT / ".env")
-    for key, value in values.items():
+    for key, value in dotenv_values(ROOT / ".env").items():
         if key.endswith("_API_KEY") and value:
             os.environ[key] = value
-    return (values.get("LLM_MODEL") or "").strip()
+
+
+def model_name() -> str:
+    """LLM_MODEL from .env"""
+    return (dotenv_values(ROOT / ".env").get("LLM_MODEL") or "").strip()
