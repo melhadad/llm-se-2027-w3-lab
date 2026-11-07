@@ -27,14 +27,6 @@ from triage_lab.schema import Issue, IssueType, TriageRecord
 
 RESULTS_PATH = ROOT / "outputs" / "results" / "w3_results.json"
 
-InputBuilder = Callable[[Issue], dict[str, Any]]
-
-
-def issue_only(issue: Issue) -> dict[str, Any]:
-    """The default inputs of one call: the issue, and nothing else."""
-    return {"issue": issue}
-
-
 _gold: dict[tuple[str, int], IssueType | None] = {}
 
 
@@ -96,14 +88,11 @@ def run(
     start: int = 0,
     stop: int = 20,
     *,
-    inputs: InputBuilder = issue_only,
     part: str | None = None,
 ) -> list[Result]:
-    """Run `program` on issues[start:stop], print a table and a summary.
+    """Run `program(issue=...)` on issues[start:stop], print a table and a summary.
 
-    `inputs` builds the keyword arguments for one call (default: just
-    `issue=...`). Pass `part="..."` to record the result for
-    the score table at the end of the notebook.
+    Pass `part="..."` to record the result for the score table at the end of the notebook.
     """
     lm = dspy.settings.lm
     history_before = len(lm.history) if lm is not None else 0
@@ -111,7 +100,7 @@ def run(
     for issue in issues[start:stop]:
         gold = gold_type(issue)
         try:
-            prediction = program(**inputs(issue))
+            prediction = program(issue=issue)
         except Exception as exc:  # noqa: BLE001 - a failed call is a result too
             results.append(Result(issue, gold, None, None, f"{type(exc).__name__}: {str(exc)[:80]}"))
             continue
